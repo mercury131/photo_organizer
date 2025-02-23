@@ -17,11 +17,6 @@ if sys.platform.startswith('win'):
     sys.stdout.reconfigure(encoding='utf-8')
     locale.setlocale(locale.LC_ALL, 'Russian_Russia.65001')
 
-
-
-
-
-# Глобальные функции для multiprocessing
 def process_file_create(file_path):
     try:
         with Image.open(file_path) as img:
@@ -44,34 +39,48 @@ def process_file_find(args):
     except Exception as e:
         return (file_path, None)
 
-
 def create_db(home_library_path, db_path='phash_db.sqlite'):
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
-    print("home_library_path - ",home_library_path)
+    print("home_library_path - ", home_library_path)
     
-    # Создаем таблицу и индексы (если не существуют)
     c.execute('''CREATE TABLE IF NOT EXISTS images 
-                (phash TEXT, file_path TEXT UNIQUE)''')  # Добавляем UNIQUE constraint
+                (phash TEXT, file_path TEXT UNIQUE)''')
     c.execute('CREATE INDEX IF NOT EXISTS phash_idx ON images (phash)')
     c.execute('CREATE INDEX IF NOT EXISTS file_path_idx ON images (file_path)')
 
-    # Загружаем существующие пути из БД
     existing_files = set()
     print("🕵️ Checking existing files in database...")
     c.execute('SELECT file_path FROM images')
     for row in c.fetchall():
-        existing_files.add(row[0])
+        existing_files.add(os.path.normpath(row[0]))
     print(f"Found {len(existing_files)} pre-existing files in DB")
 
-    # Фильтруем новые файлы
-    print("🔍 Scanning for new files...")
+    print("🔍 Scanning for new and existing files...")
+    current_files = set()
     new_files = []
     for root, _, files in os.walk(home_library_path):
         for f in files:
-            file_path = os.path.join(root, f)
-            if file_path.lower().endswith(('jpg', 'jpeg', 'png', 'gif', 'bmp')) and file_path not in existing_files:
-                new_files.append(file_path)
+            file_path = os.path.normpath(os.path.join(root, f))
+            if file_path.lower().endswith(('jpg', 'jpeg', 'png', 'gif', 'bmp')):
+                current_files.add(file_path)
+                if file_path not in existing_files:
+                    new_files.append(file_path)
+
+    missing_files = existing_files - current_files
+    if missing_files:
+        print(f"🧹 Found {len(missing_files)} files in DB that are missing on disk. Cleaning up...")
+        chunk_size = 999
+        missing_files_list = list(missing_files)
+        total_deleted = 0
+        for i in range(0, len(missing_files_list), chunk_size):
+            chunk = missing_files_list[i:i+chunk_size]
+            placeholders = ','.join(['?'] * len(chunk))
+            c.execute(f"DELETE FROM images WHERE file_path IN ({placeholders})", chunk)
+            total_deleted += c.rowcount
+        print(f"🚮 Removed {total_deleted} entries from DB")
+    else:
+        print("✅ No missing files to clean up in DB")
 
     total_new = len(new_files)
     if total_new == 0:
@@ -79,15 +88,15 @@ def create_db(home_library_path, db_path='phash_db.sqlite'):
         conn.close()
         return
 
-    # Обработка только новых файлов с прогресс-баром
     progress = tqdm(total=total_new, desc="Processing", unit="file")
     
     with Pool(cpu_count()) as pool:
         for result in pool.imap_unordered(process_file_create, new_files, chunksize=50):
             if result:
+                phash, file_path = result
                 try:
-                    c.execute('INSERT INTO images VALUES (?, ?)', result)
-                except sqlite3.IntegrityError:  # На случай параллельных записей
+                    c.execute('INSERT INTO images VALUES (?, ?)', (phash, file_path))
+                except sqlite3.IntegrityError:
                     pass
             progress.update()
     
@@ -96,15 +105,13 @@ def create_db(home_library_path, db_path='phash_db.sqlite'):
     print(f"Added {total_new} new files to database")
     conn.close()
 
-
 def find_duplicates(new_dirs, db_path='phash_db.sqlite', output_dup='duplicates.txt', output_uniq='unique.txt'):
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
 
-    # Сбор файлов
     print("🔍 Collecting files to check...")
     new_files = []
-    search_roots = [os.path.normpath(d) for d in new_dirs]  # Нормализуем пути для сравнения
+    search_roots = [os.path.normpath(d) for d in new_dirs]
     
     for d in new_dirs:
         for root, _, files in os.walk(d):
@@ -118,10 +125,8 @@ def find_duplicates(new_dirs, db_path='phash_db.sqlite', output_dup='duplicates.
         conn.close()
         return
 
-    # Подготовка аргументов
     args_list = [(file_path, db_path) for file_path in new_files]
 
-    # Обработка с прогресс-баром
     duplicates = []
     unique = []
     
@@ -135,14 +140,11 @@ def find_duplicates(new_dirs, db_path='phash_db.sqlite', output_dup='duplicates.
                     unique.append(file_path)
                 progress.update()
 
-    # Сохранение результатов с корректной кодировкой
     print("💾 Saving results...")
     
-    # 1. Полная версия duplicates.txt
     with open(output_dup, 'w', encoding='utf-8', errors='replace') as f:
         f.write('\n'.join([f"{dup[0]}\t{dup[1]}" for dup in duplicates]))
     
-    # 2. Фильтрованная версия duplicates_filtered.txt (только из проверяемых директорий)
     filtered_duplicates = [
         dup for dup in duplicates 
         if any(os.path.normpath(dup[0]).startswith(root) for root in search_roots)
@@ -151,27 +153,23 @@ def find_duplicates(new_dirs, db_path='phash_db.sqlite', output_dup='duplicates.
     with open('duplicates_filtered.txt', 'w', encoding='utf-8', errors='replace') as f:
         f.write('\n'.join([dup[0] for dup in filtered_duplicates]))
     
-    # Файл unique.txt
     with open(output_uniq, 'w', encoding='utf-8', errors='replace') as f:
         f.write('\n'.join(unique))
 
     conn.close()
     print(f"✅ Done! Duplicates: {len(duplicates)}, Filtered duplicates: {len(filtered_duplicates)}, Unique: {len(unique)}")
 
-
 def select_directory():
-    # Создаем скрытое основное окно Tkinter
     root = tk.Tk()
-    root.withdraw()  # Скрываем главное окно
+    root.withdraw()
     
-    # Открываем диалоговое окно выбора директории
     directory = filedialog.askdirectory(
         title="Выберите каталог для поиска дубликатов",
-        initialdir="C:\\",  # Можно задать начальную директорию
-        mustexist=True  # Позволяет выбрать только существующие каталоги
+        initialdir="C:\\",
+        mustexist=True
     )
     
-    if directory:  # Если пользователь выбрал каталог
+    if directory:
         normalized_path = Path(directory).resolve().as_posix().replace('/', '\\')
         print("Выбор - ",normalized_path)
         find_duplicates([normalized_path])
@@ -179,12 +177,9 @@ def select_directory():
         print("Выбор отменен.")    
 
 if __name__ == '__main__':
-
     with open('config.yaml', 'r', encoding='utf-8') as file:
         application_config = yaml.safe_load(file)
 
-    photo_db_path=(application_config['library']['path'])
+    photo_db_path = application_config['library']['path']
     create_db(photo_db_path)
     freeze_support()
-
-    
